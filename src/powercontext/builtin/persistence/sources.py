@@ -339,6 +339,16 @@ class SourceRepository:
             raise InvalidStoredColumnError("journal_position", "an integer")
         return int(value)
 
+    async def journal_scopes(self, connection: AsyncConnection, /) -> tuple[str, ...]:
+        """List every scope that already owns at least one journal identity."""
+
+        rows = await connection.scalars(
+            select(SOURCE_JOURNAL_HEADS_TABLE.c.scope_id)
+            .where(SOURCE_JOURNAL_HEADS_TABLE.c.position > 0)
+            .order_by(SOURCE_JOURNAL_HEADS_TABLE.c.scope_id)
+        )
+        return tuple(str(row) for row in rows)
+
     async def read_value(self, source: Source, /) -> object:
         """Read one decoded Source through the same registered adapter route."""
 

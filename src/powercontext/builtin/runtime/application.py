@@ -221,6 +221,11 @@ from powercontext.builtin.runtime.prepared_context import (
     PreparedMemoryCandidates,
     PreparedProfileCandidate,
 )
+from powercontext.builtin.runtime.source_lifecycle import (
+    ScopedSourceLifecycle,
+    SourceLifecycleError,
+    SourceLifecycleNode,
+)
 from powercontext.builtin.runtime.protocols import (
     BuiltinTriggers,
     PowerContextProvider,
@@ -322,6 +327,10 @@ class TopicMemorySearch(Protocol):
 TopicMemoryGet = Callable[[str, ArtifactRef], Awaitable[PublishedTopicMemory]]
 TopicMemoryBrowse = Callable[..., Awaitable[tuple[TopicMemoryCurrentItem, ...]]]
 TopicMemoryFlush = Callable[[str], Awaitable[bool]]
+TopicMemoryPending = Callable[[str], Awaitable[int]]
+JournalScopes = Callable[[], Awaitable[tuple[str, ...]]]
+SourceLifecycleNodeReader = Callable[[str], Awaitable[tuple[Mapping[str, Any], ...]]]
+SourceLifecycleNodeWriter = Callable[[str, Sequence[Mapping[str, Any]]], Awaitable[None]]
 TopicMemorySearchObserver = Callable[[str, bool], None]
 
 logger = logging.getLogger(__name__)
@@ -469,7 +478,9 @@ class ScopedSourceApplication:
         self.scope_id = validate_scope_id(scope_id)
 
     async def capture(self, value: CaptureSource, /) -> SourceReceipt:
-        return await self._capture(value)
+        receipt = await self._capture(value)
+        await self._runtime._admit_count_windows(self.scope_id)
+        return receipt
 
     async def _capture(self, value: CaptureSource, /, *, handoff_receipt: bool = False) -> SourceReceipt:
         if self._runtime._record_service is not None:
@@ -563,7 +574,9 @@ class ScopedRecordApplication:
         /,
     ) -> ArtifactCreated:
         async with self._runtime._scope_operation(self.scope_id), self._runtime._locked(self.scope_id):
-            return await self._runtime._records().create_artifact(self.scope_id, family, write)
+            created = await self._runtime._records().create_artifact(self.scope_id, family, write)
+        await self._runtime._admit_count_windows(self.scope_id)
+        return created
 
     async def get_artifact(self, family: str, artifact_id: str, /) -> ArtifactRecord:
         async with self._runtime._scope_operation(self.scope_id):
@@ -828,6 +841,32 @@ class ScopedContextApplication:
         self._runtime = runtime
         self.scope_id = validate_scope_id(scope_id)
 
+    async def prepare_incremental(
+        self,
+        request: PrepareContextRequest,
+        /,
+        *,
+        base_pack: object | None = None,
+    ) -> object:
+        """Return this request's Context as a pack, or a delta against a previous pack.
+
+        The pack is built from the same bytes an ordinary ``prepare`` returns, so a
+        receiver that applies the delta reconstructs the plain Context body exactly.
+        """
+
+        from powercontext.builtin.runtime.context_pack import (  # noqa: PLC0415
+            ContextPack,
+            ContextPackDelta,
+        )
+
+        prepared = await self.prepare(request)
+        pack = ContextPack.from_content(prepared.content or "")
+        if base_pack is None:
+            return pack
+        if not isinstance(base_pack, ContextPack):
+            raise InvalidRuntimeRequestError("context-pack-base")
+        return ContextPackDelta.between(base_pack, pack)
+
     async def prepare(
         self,
         request: PrepareContextRequest,
@@ -962,6 +1001,12 @@ class ScopedContextApplication:
                 round_zero=round_zero,
             )
         code = await self._code_candidates(request) if request.include_code else ()
+        if topic_memory_hits:
+            inactive_topics = await self._runtime.lifecycle.for_scope(self.scope_id).inactive_topics()
+            if inactive_topics:
+                topic_memory_hits = tuple(
+                    hit for hit in topic_memory_hits if hit.artifact_ref.artifact_id not in inactive_topics
+                )
         with self._runtime._stage(
             "context.build",
             attributes={
@@ -2601,6 +2646,56 @@ class ScopedMemoryApplication:
         async with self._runtime._context(self.scope_id) as context:
             return await context.triggers.cursor()
 
+    async def pending(self) -> int:
+        """Count journal identities this Scope's Memory cursor has not consumed yet."""
+
+        async with self._runtime._context(self.scope_id) as context:
+            return await context.triggers.pending()
+
+    async def set_entry_active(
+        self,
+        citation: MemoryCitation,
+        active: bool,
+        /,
+        *,
+        reason: str | None = None,
+    ) -> bool:
+        """Change one entry's use eligibility without touching its body.
+
+        Returns whether the stored state changed, so a lifecycle replay that lands on the
+        state already recorded never mints a new Memory revision.
+        """
+
+        target = "active" if active else "inactive"
+        async with self._runtime._context(
+            self.scope_id,
+            embedding_purpose=ModelUsagePurpose.MEMORY_INDEXING,
+        ) as context:
+            async with self._runtime._locked(self.scope_id):
+                service = context.artifacts.memory
+                current = await _head_or_none(service, context.artifacts.memory_artifact_id)
+                if current is None:
+                    raise SourceLifecycleError("memory-missing", citation.entry_id)
+                manifest_entry = next(
+                    (item for item in current.content.manifest.entries if item.entry_id == citation.entry_id),
+                    None,
+                )
+                if manifest_entry is None:
+                    raise SourceLifecycleError("memory-entry-missing", citation.entry_id)
+                if manifest_entry.state == target:
+                    return False
+                version = next(
+                    (item for item in await service.entries(current) if item.entry_id == citation.entry_id),
+                    None,
+                )
+                if version is None:
+                    raise SourceLifecycleError("memory-entry-missing", citation.entry_id)
+                if active:
+                    await service.reactivate(current, entries=(version,), reason=reason)
+                else:
+                    await service.forget(current, entries=(version,), reason=reason)
+                return True
+
 
 class MemoryApplication:
     """Select the application service for one Memory family scope."""
@@ -2610,6 +2705,32 @@ class MemoryApplication:
 
     def for_scope(self, scope_id: str, /) -> ScopedMemoryApplication:
         return ScopedMemoryApplication(self._runtime, scope_id)
+
+
+class SourceLifecycleApplication:
+    """Select the Source-lifecycle service for one Scope."""
+
+    def __init__(self, runtime: BuiltinRuntime) -> None:
+        self._runtime = runtime
+        self._locks: dict[str, asyncio.Lock] = {}
+
+    def for_scope(self, scope_id: str, /) -> ScopedSourceLifecycle:
+        scope = validate_scope_id(scope_id)
+        lock = self._locks.get(scope)
+        if lock is None:
+            lock = self._locks[scope] = asyncio.Lock()
+        return ScopedSourceLifecycle(
+            scope,
+            load=lambda: self._runtime._load_lifecycle_nodes(scope),
+            save=lambda nodes: self._runtime._save_lifecycle_nodes(scope, nodes),
+            write_entry_state=lambda citation, active: self._runtime.memory.for_scope(scope).set_entry_active(
+                citation, active
+            ),
+            reference_exists=lambda family, reference: self._runtime._lifecycle_reference_exists(
+                scope, family, reference
+            ),
+            lock=lock,
+        )
 
 
 class ScopedTopicMemoryApplication:
@@ -2683,7 +2804,16 @@ class ScopedTopicMemoryApplication:
                         "unit": "topic-memory",
                     },
                 )
-        return result
+        return await self._without_unsupported(result)
+
+    async def _without_unsupported(self, result: TopicMemorySearchResult) -> TopicMemorySearchResult:
+        """Drop hits whose Topic lost the evidence support its body depends on."""
+
+        inactive = await self._runtime.lifecycle.for_scope(self.scope_id).inactive_topics()
+        if not inactive:
+            return result
+        hits = tuple(hit for hit in result.hits if hit.artifact_ref.artifact_id not in inactive)
+        return result if len(hits) == len(result.hits) else result.model_copy(update={"hits": hits})
 
     async def _search_with_embedding(
         self,
@@ -2778,7 +2908,11 @@ class ScopedTopicMemoryApplication:
         if not 1 <= limit <= 100:
             raise InvalidRuntimeRequestError("topic-memory-browse-limit")
         async with self._runtime._scoped_operation(self.scope_id):
-            return await self._runtime._topic_memory_browse(self.scope_id, limit=limit, after=after)
+            rows = await self._runtime._topic_memory_browse(self.scope_id, limit=limit, after=after)
+        inactive = await self._runtime.lifecycle.for_scope(self.scope_id).inactive_topics()
+        if not inactive:
+            return rows
+        return tuple(row for row in rows if row.artifact_ref.artifact_id not in inactive)
 
     async def flush(self) -> TopicMemoryFlushResult:
         if not self._runtime._topic_memory_processing_available or self._runtime._topic_memory_flush is None:
@@ -3024,6 +3158,12 @@ class BuiltinRuntime:
         tracing: RuntimeTracing | None = None,
         scheduled_source_runner: ScheduledSourceRunner | None = None,
         scheduled_experience_runner: ScheduledExperienceRunner | None = None,
+        topic_memory_pending: TopicMemoryPending | None = None,
+        journal_scopes: JournalScopes | None = None,
+        lifecycle_nodes: SourceLifecycleNodeReader | None = None,
+        save_lifecycle_nodes: SourceLifecycleNodeWriter | None = None,
+        memory_source_count_threshold: int | None = None,
+        topic_memory_source_count_threshold: int | None = None,
         remote_ingestion: RemoteIngestion | None = None,
         dream_service: DreamService | None = None,
         generation_concurrency: int = 4,
@@ -3082,6 +3222,14 @@ class BuiltinRuntime:
         self._tracing = tracing
         self._scheduled_source_runner = scheduled_source_runner
         self._scheduled_experience_runner = scheduled_experience_runner
+        self._topic_memory_pending = topic_memory_pending
+        self._journal_scopes = journal_scopes
+        self._lifecycle_node_reader = lifecycle_nodes
+        self._lifecycle_node_writer = save_lifecycle_nodes
+        self._memory_source_count_threshold = memory_source_count_threshold
+        self._topic_memory_source_count_threshold = topic_memory_source_count_threshold
+        self._count_tasks: set[asyncio.Task[None]] = set()
+        self._count_locks: dict[str, asyncio.Lock] = {}
         self.source_window_limit = source_window_limit
         self.context_assembly_max_entries = context_assembly_max_entries
         self.recall_sufficiency_policy = recall_sufficiency_policy
@@ -3109,6 +3257,7 @@ class BuiltinRuntime:
         self.handoff = HandoffApplication(self)
         self.work = WorkApplication(self)
         self.memory = MemoryApplication(self)
+        self.lifecycle = SourceLifecycleApplication(self)
         self.topic_memory = TopicMemoryApplication(self)
         self.records = RecordApplication(self)
         self.prompts = PromptApplication(self)
@@ -3124,10 +3273,150 @@ class BuiltinRuntime:
         )
 
     async def __aenter__(self) -> BuiltinRuntime:
+        self._start_count_catch_up()
         return self
 
     async def __aexit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
         await self.close()
+
+    def _start_count_catch_up(self) -> None:
+        """Resume work that reached its count threshold but did not finish before a restart."""
+
+        if self._memory_source_count_threshold is None and self._topic_memory_source_count_threshold is None:
+            return
+        if self._journal_scopes is None:
+            return
+        self._spawn_count_task(self._catch_up_count_windows())
+
+    def _spawn_count_task(self, coroutine: Any) -> None:
+        task = asyncio.create_task(coroutine)
+        self._count_tasks.add(task)
+        task.add_done_callback(self._count_tasks.discard)
+
+    def _count_lock(self, scope_id: str, /) -> asyncio.Lock:
+        """One admission gate per Scope, created on first use."""
+
+        lock = self._count_locks.get(scope_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._count_locks[scope_id] = lock
+        return lock
+
+    async def _catch_up_count_windows(self) -> None:
+        if self._journal_scopes is None:
+            return
+        try:
+            scope_ids = await self._journal_scopes()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            log_safely(logger, logging.WARNING, "Count admission catch-up could not list scopes", exc_info=error)
+            return
+        for scope_id in scope_ids:
+            if self._closing or self._closed:
+                return
+            await self._admit_count_windows(scope_id)
+
+    async def _admit_count_windows(self, scope_id: str, /) -> None:
+        """Start at most one processing window per family whose pending count reached its threshold.
+
+        Count and time conditions are alternatives, so reaching the threshold starts exactly the
+        call the schedule would have made. One accepted window per crossing keeps the window
+        limit a real per-call bound instead of a hidden "drain everything" rule.
+
+        Startup catch-up and the capture path can both observe the same crossing, so admission
+        is serialized per Scope. The pending count is read inside the lock: whoever runs second
+        sees the count the first window already consumed and therefore starts nothing.
+        """
+
+        if self._memory_source_count_threshold is None and self._topic_memory_source_count_threshold is None:
+            return
+        async with self._count_lock(scope_id):
+            await self._admit_count_windows_locked(scope_id)
+
+    async def _admit_count_windows_locked(self, scope_id: str, /) -> None:
+        memory_threshold = self._memory_source_count_threshold
+        if memory_threshold is not None:
+            try:
+                memory = self.memory.for_scope(scope_id)
+                if await memory.pending() >= memory_threshold:
+                    await memory.flush()
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                log_safely(
+                    logger,
+                    logging.WARNING,
+                    "Count admission Memory window failed",
+                    exc_info=error,
+                    extra={
+                        "event": "memory.count_admission.failed",
+                        "outcome": "failed",
+                        "unit": "memory",
+                        "scope_id": scope_id,
+                    },
+                )
+
+        topic_threshold = self._topic_memory_source_count_threshold
+        if topic_threshold is not None and self._topic_memory_pending is not None:
+            try:
+                if await self._topic_memory_pending(scope_id) >= topic_threshold:
+                    await self.topic_memory.for_scope(scope_id).flush()
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                log_safely(
+                    logger,
+                    logging.WARNING,
+                    "Count admission Topic Memory window failed",
+                    exc_info=error,
+                    extra={
+                        "event": "topic_memory.count_admission.failed",
+                        "outcome": "failed",
+                        "unit": "topic-memory",
+                        "scope_id": scope_id,
+                    },
+                )
+
+    async def _load_lifecycle_nodes(self, scope_id: str, /) -> tuple[SourceLifecycleNode, ...]:
+        if self._lifecycle_node_reader is None:
+            return ()
+        rows = await self._lifecycle_node_reader(scope_id)
+        return tuple(SourceLifecycleNode.model_validate(dict(row)) for row in rows)
+
+    async def _save_lifecycle_nodes(self, scope_id: str, nodes: Sequence[SourceLifecycleNode], /) -> None:
+        if self._lifecycle_node_writer is None:
+            raise SourceLifecycleError("persistence", "source lifecycle storage is unavailable")
+        await self._lifecycle_node_writer(scope_id, [node.model_dump(mode="json") for node in nodes])
+
+    async def _lifecycle_reference_exists(
+        self,
+        scope_id: str,
+        family: str,
+        reference: Mapping[str, Any],
+        /,
+    ) -> bool:
+        """Report whether one registered reference is present and readable in this Scope."""
+
+        try:
+            if family == "source":
+                source = SourceRef.model_validate(reference)
+                await self.records.for_scope(scope_id).get_source(source.source_type, source.source_id)
+            elif family == "memory":
+                citation = MemoryCitation.model_validate(reference)
+                await self.memory.for_scope(scope_id).get(GetMemoryEntryRequest(citation=citation))
+            else:
+                artifact = ArtifactRef.model_validate(reference)
+                await self.records.for_scope(scope_id).get_artifact_revision(
+                    artifact.family,
+                    artifact.artifact_id,
+                    artifact.revision,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return False
+        return True
 
     async def capabilities(self) -> RuntimeCapabilities:
         async with self._operation():
@@ -3263,6 +3552,11 @@ class BuiltinRuntime:
         async with self._close_lock:
             if self._closed:
                 return
+            for task in tuple(self._count_tasks):
+                task.cancel()
+            if self._count_tasks:
+                await asyncio.gather(*self._count_tasks, return_exceptions=True)
+            self._count_locks.clear()
             if self._scheduler is not None and self._scheduler.running:
                 self._scheduler.pause()
             async with self._lifecycle:

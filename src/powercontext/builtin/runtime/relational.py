@@ -33,7 +33,7 @@ from jsonschema.exceptions import ValidationError as JsonSchemaValidationError
 from jsonschema.protocols import Validator
 from referencing import Registry
 from referencing.exceptions import Unresolvable
-from sqlalchemy import select
+from sqlalchemy import delete, insert, select
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from powercontext.artifacts import Artifact, ArtifactRef, MemoryCitation
@@ -158,7 +158,11 @@ from powercontext.builtin.persistence.supervision import (
     ArtifactProcessingBindingStateRepository,
     ArtifactProcessingLeaseRepository,
 )
-from powercontext.builtin.persistence.tables import ARTIFACT_HEADS_TABLE, SOURCE_JOURNAL_HEADS_TABLE
+from powercontext.builtin.persistence.tables import (
+    ARTIFACT_HEADS_TABLE,
+    SOURCE_JOURNAL_HEADS_TABLE,
+    SOURCE_LIFECYCLE_TABLE,
+)
 from powercontext.builtin.persistence.topic_memory import TopicMemoryRepository
 from powercontext.builtin.persistence.topic_memory_index import NoTopicMemoryIndex, TopicMemoryIndex
 from powercontext.builtin.persistence.topic_memory_management import TopicMemoryManagementWriter
@@ -952,6 +956,62 @@ class RelationalContexts:
                 )
         return pending is not None
 
+    async def topic_memory_pending(self, scope_id: str, /) -> int:
+        """Count journal identities the Topic Memory cursor has not consumed yet."""
+
+        scope = validate_scope_id(scope_id)
+        async with self.database.transaction() as connection:
+            state = await self.repositories.cursors.load(
+                connection,
+                scope,
+                TOPIC_MEMORY_SOURCE_WINDOW_BINDING,
+            )
+            high_watermark = await self.repositories.sources.journal_position(connection, scope)
+        after = 0 if state is None else state.cursor.sequence
+        return max(0, high_watermark - after)
+
+    async def scopes_with_journal(self) -> tuple[str, ...]:
+        """List every Scope that already owns a journal identity, for restart catch-up."""
+
+        async with self.database.transaction() as connection:
+            return await self.repositories.sources.journal_scopes(connection)
+
+    async def lifecycle_nodes(self, scope_id: str, /) -> tuple[dict[str, Any], ...]:
+        """Read one Scope's persisted evidence dependency DAG in registration order."""
+
+        scope = validate_scope_id(scope_id)
+        async with self.database.transaction() as connection:
+            rows = (
+                await connection.execute(
+                    select(SOURCE_LIFECYCLE_TABLE)
+                    .where(SOURCE_LIFECYCLE_TABLE.c.scope_id == scope)
+                    .order_by(SOURCE_LIFECYCLE_TABLE.c.ordinal)
+                )
+            ).all()
+        return tuple(_lifecycle_row(row) for row in rows)
+
+    async def save_lifecycle_nodes(self, scope_id: str, nodes: Any, /) -> None:
+        """Replace one Scope's evidence dependency DAG with the supplied nodes."""
+
+        scope = validate_scope_id(scope_id)
+        async with self.database.transaction() as connection:
+            await connection.execute(delete(SOURCE_LIFECYCLE_TABLE).where(SOURCE_LIFECYCLE_TABLE.c.scope_id == scope))
+            for node in nodes:
+                await connection.execute(
+                    insert(SOURCE_LIFECYCLE_TABLE).values(
+                        scope_id=scope,
+                        node_id=node["node_id"],
+                        family=node["family"],
+                        reference=_lifecycle_encode(node["reference"]),
+                        parents=_lifecycle_encode(list(node["parents"])),
+                        policy=node["policy"],
+                        available=bool(node["available"]),
+                        revision=int(node["revision"]),
+                        sequence=int(node["sequence"]),
+                        ordinal=int(node["ordinal"]),
+                    )
+                )
+
     async def browse_topic_memories(
         self,
         scope_id: str,
@@ -1681,6 +1741,22 @@ class _RelationalTriggers:
             )
         return self._trigger.initial_state() if state is None else state.cursor
 
+    async def pending(self) -> int:
+        """Count journal identities not yet consumed by this Scope's Memory cursor."""
+
+        async with self._services.database.transaction() as connection:
+            state = await self._services.repositories.cursors.load(
+                connection,
+                self._services.scope_id,
+                SOURCE_WINDOW_TRIGGER_NAME,
+            )
+            high_watermark = await self._services.repositories.sources.journal_position(
+                connection,
+                self._services.scope_id,
+            )
+        after = 0 if state is None else state.cursor.sequence
+        return max(0, high_watermark - after)
+
     @prompt_operation("memory.extract")
     async def flush(
         self,
@@ -2058,3 +2134,25 @@ def _scoped_id_factory(memory_artifact_id: str, delegate: IdFactory | None) -> I
         return f"{prefixes[kind]}_{uuid4().hex}"
 
     return new_id
+
+
+def _lifecycle_encode(value: Any) -> bytes:
+    """Render one lifecycle column value as canonical UTF-8 JSON bytes."""
+
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _lifecycle_row(row: Any) -> dict[str, Any]:
+    """Decode one persisted lifecycle node row into its node mapping."""
+
+    return {
+        "node_id": str(row.node_id),
+        "family": str(row.family),
+        "reference": json.loads(bytes(row.reference).decode("utf-8")),
+        "parents": tuple(json.loads(bytes(row.parents).decode("utf-8"))),
+        "policy": str(row.policy),
+        "available": bool(row.available),
+        "revision": int(row.revision),
+        "sequence": int(row.sequence),
+        "ordinal": int(row.ordinal),
+    }

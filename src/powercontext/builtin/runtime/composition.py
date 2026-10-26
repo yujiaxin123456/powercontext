@@ -85,7 +85,7 @@ from powercontext.builtin.persistence.memory_index import CompositeMemoryIndex, 
 from powercontext.builtin.persistence.oceanbase.experience_index import OceanBaseExperienceFTSIndex
 from powercontext.builtin.persistence.oceanbase.memory_index import (
     OceanBaseMemoryFTSIndex,
-    OceanBaseMemoryVectorIndex,
+    OceanBaseMemoryHybridIndex,
 )
 from powercontext.builtin.persistence.oceanbase.profile import OceanBaseConfig, OceanBaseProfile
 from powercontext.builtin.persistence.oceanbase.topic_memory_index import (
@@ -631,6 +631,12 @@ async def open_builtin_runtime(
                 topic_memory_get=contexts.get_topic_memory,
                 topic_memory_browse=contexts.browse_topic_memories,
                 topic_memory_flush=contexts.request_topic_memory_flush,
+                topic_memory_pending=contexts.topic_memory_pending,
+                journal_scopes=contexts.scopes_with_journal,
+                lifecycle_nodes=contexts.lifecycle_nodes,
+                save_lifecycle_nodes=contexts.save_lifecycle_nodes,
+                memory_source_count_threshold=config.runtime.memory_source_count_threshold,
+                topic_memory_source_count_threshold=config.runtime.topic_memory_source_count_threshold,
                 topic_memory_embedding_model=configured_embedding,
                 topic_memory_processing_available=topic_memory_processing_available,
                 topic_memory_search_observer=topic_memory_search_observer,
@@ -962,7 +968,9 @@ async def open_builtin_contexts(
     experience_index = OceanBaseExperienceFTSIndex()
     indexes = [OceanBaseMemoryFTSIndex()]
     if embedding_model is not None:
-        indexes.append(OceanBaseMemoryVectorIndex(embedding_model.profile))
+        # One strategy owns the vector projection and answers hybrid reads with a single
+        # native statement, so the engine fuses FULLTEXT and ANN instead of this process.
+        indexes = [OceanBaseMemoryHybridIndex(embedding_model.profile)]
     index = CompositeMemoryIndex(*indexes)
     topic_indexes: list[TopicMemoryIndex] = [OceanBaseTopicMemoryFTSIndex()]
     if embedding_model is not None:

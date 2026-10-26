@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
-from typing import Any, Literal, Self
+from typing import Annotated, Any, Literal, Self
 
 from pydantic import (
     AnyHttpUrl,
@@ -208,6 +208,10 @@ class RuntimeConfig(BaseModel):
     dream_budget: DreamBudget = Field(default_factory=DreamBudget)
     topic_memory_schedule_seconds: float | None = Field(default=None, gt=0)
     topic_memory_source_window_limit: int = Field(default=10, ge=1)
+    # Count admission: start one processing window once this many journal identities are pending.
+    # ``None`` keeps the time-only behaviour, so an unconfigured runtime never self-starts.
+    memory_source_count_threshold: Annotated[int, Field(strict=True, ge=1)] | None = None
+    topic_memory_source_count_threshold: Annotated[int, Field(strict=True, ge=1)] | None = None
     topic_memory_history_max_candidates: int = Field(default=20, ge=1, le=MAX_TOPIC_MEMORY_SEARCH_LIMIT)
     topic_memory_history_rrf_threshold: int = Field(default=70, ge=0, le=100)
     topic_memory_history_min_candidates: int = Field(default=5, ge=1, le=MAX_TOPIC_MEMORY_SEARCH_LIMIT)
